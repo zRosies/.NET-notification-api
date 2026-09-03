@@ -12,7 +12,16 @@ var builder = WebApplication.CreateBuilder(args);
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 builder.Services.AddControllers();
+builder.Services.AddHttpClient<BrevoNotificationProvider>();
+builder.Services.AddHttpClient<SlackNotificationProvider>();
 builder.Services.AddScoped<INotificationService, NotificationService>();
+builder.Services.AddScoped<INotificationProvider>(sp =>
+    new CompositeNotificationProvider(
+    [
+        sp.GetRequiredService<BrevoNotificationProvider>(),
+        sp.GetRequiredService<SlackNotificationProvider>()
+    ]));
+builder.Services.AddHostedService<RabbitMqNotificationConsumerService>();
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
 var connectionString = builder.Environment.IsProduction() && !string.IsNullOrWhiteSpace(databaseUrl)
     ? DatabaseUrlParser.ToConnectionString(databaseUrl)
@@ -51,6 +60,29 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<NotificationsDbContext>();
     db.Database.EnsureCreated();
+    db.Database.ExecuteSqlRaw("ALTER TABLE \"Notifications\" ALTER COLUMN \"Message\" TYPE text;");
+    db.Database.ExecuteSqlRaw("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'Notifications'
+                  AND column_name = 'Type'
+                  AND data_type = 'character varying'
+            ) THEN
+                ALTER TABLE "Notifications" ALTER COLUMN "Type" TYPE integer
+                USING CASE LOWER(TRIM("Type"))
+                    WHEN 'order_created' THEN 0
+                    WHEN 'payment_succeeded' THEN 1
+                    WHEN 'payment_failed' THEN 2
+                    ELSE "Type"::integer
+                END;
+            END IF;
+        END $$;
+        """);
+    db.Database.ExecuteSqlRaw("ALTER TABLE \"Notifications\" ADD COLUMN IF NOT EXISTS \"EntityId\" text;");
+    db.Database.ExecuteSqlRaw("ALTER TABLE \"Notifications\" ADD COLUMN IF NOT EXISTS \"Metadata\" text;");
 }
 
 var summaries = new[]
